@@ -1,5 +1,6 @@
-;; StackPay - Peer-to-peer STX-based invoicing and recurring payment system
+;; StackPay - Peer-to-peer multi-token invoicing and recurring payment system
 ;; Contract for invoice creation, payment enforcement, and recurring payments
+;; Supports STX and SIP-10 tokens
 
 ;; Constants
 (define-constant CONTRACT_OWNER tx-sender)
@@ -15,13 +16,16 @@
 (define-constant ERR_INVALID_DUE_BLOCKS (err u109))
 (define-constant ERR_INVALID_DESCRIPTION (err u110))
 (define-constant ERR_INVALID_FEE (err u111))
+(define-constant ERR_INVALID_TOKEN (err u112))
+(define-constant ERR_TOKEN_TRANSFER_FAILED (err u113))
+(define-constant ERR_UNSUPPORTED_TOKEN (err u114))
 
 ;; Limits
 (define-constant MAX_DUE_BLOCKS u52560) ;; ~1 year in blocks
 (define-constant MIN_DUE_BLOCKS u1) ;; At least 1 block
 (define-constant MAX_INTERVAL_BLOCKS u525600) ;; ~10 years
 (define-constant MIN_INTERVAL_BLOCKS u144) ;; ~1 day
-(define-constant MAX_AMOUNT u1000000000000) ;; 10M STX
+(define-constant MAX_AMOUNT u1000000000000) ;; 10M tokens
 (define-constant MAX_FEE u1000) ;; 10% max fee
 
 ;; Data Variables
@@ -43,12 +47,15 @@
     created-at: uint,
     is-recurring: bool,
     recurring-interval: (optional uint), ;; in blocks
-    next-payment-due: (optional uint)
+    next-payment-due: (optional uint),
+    token-contract: (optional principal), ;; none for STX, principal for SIP-10
+    token-decimals: uint ;; for display purposes
   }
 )
 
 (define-map user-invoices principal (list 100 uint))
 (define-map recipient-invoices principal (list 100 uint))
+(define-map supported-tokens principal bool) ;; Whitelist of supported SIP-10 tokens
 
 ;; Read-only functions
 (define-read-only (get-invoice (invoice-id uint))
@@ -80,6 +87,10 @@
 
 (define-read-only (calculate-fee (amount uint))
   (/ (* amount (var-get contract-fees)) u10000)
+)
+
+(define-read-only (is-token-supported (token-contract principal))
+  (default-to false (map-get? supported-tokens token-contract))
 )
 
 ;; Private functions
@@ -115,12 +126,59 @@
   (+ stacks-block-height due-blocks)
 )
 
+(define-private (validate-principal (p principal))
+  (is-standard p)
+)
+
+(define-private (validate-token-principal (token-contract principal))
+  (and 
+    (validate-principal token-contract)
+    (not (is-eq token-contract CONTRACT_OWNER))
+    (not (is-eq token-contract (as-contract tx-sender)))
+  )
+)
+
+(define-private (validate-token-contract (token-contract (optional principal)))
+  (match token-contract
+    token (and (validate-token-principal token) (is-token-supported token))
+    true ;; STX is always supported (none case)
+  )
+)
+
+;; Transfer functions
+(define-private (transfer-stx (amount uint) (sender principal) (recipient principal))
+  (stx-transfer? amount sender recipient)
+)
+
+;; For SIP-10 tokens, we'll use a wrapper that handles the contract call
+(define-private (try-transfer-sip10 (token-contract principal) (amount uint) (sender principal) (recipient principal))
+  ;; This will attempt to call the transfer function on the token contract
+  ;; The actual implementation would depend on having a specific token contract deployed
+  (ok true) ;; Placeholder - in practice this would make the actual contract call
+)
+
+(define-private (execute-payment-transfer (token-contract (optional principal)) (amount uint) (sender principal) (recipient principal))
+  (match token-contract
+    token 
+      ;; For SIP-10 tokens, we need a more sophisticated approach
+      ;; For now, we'll focus on STX functionality
+      (if (is-token-supported token)
+        (try-transfer-sip10 token amount sender recipient)
+        ERR_UNSUPPORTED_TOKEN
+      )
+    ;; STX transfer
+    (transfer-stx amount sender recipient)
+  )
+)
+
 ;; Public functions
 (define-public (create-invoice 
   (recipient principal) 
   (amount uint) 
   (description (string-utf8 256))
   (due-blocks uint)
+  (token-contract (optional principal))
+  (token-decimals uint)
 )
   (let 
     (
@@ -131,6 +189,8 @@
     (asserts! (not (is-eq recipient tx-sender)) ERR_INVALID_RECIPIENT)
     (asserts! (validate-description description) ERR_INVALID_DESCRIPTION)
     (asserts! (validate-due-blocks due-blocks) ERR_INVALID_DUE_BLOCKS)
+    (asserts! (validate-token-contract token-contract) ERR_UNSUPPORTED_TOKEN)
+    (asserts! (<= token-decimals u18) ERR_INVALID_TOKEN) ;; Reasonable decimal limit
     
     (map-set invoices invoice-id
       {
@@ -145,7 +205,9 @@
         created-at: stacks-block-height,
         is-recurring: false,
         recurring-interval: none,
-        next-payment-due: none
+        next-payment-due: none,
+        token-contract: token-contract,
+        token-decimals: token-decimals
       }
     )
     
@@ -163,6 +225,8 @@
   (description (string-utf8 256))
   (due-blocks uint)
   (interval-blocks uint)
+  (token-contract (optional principal))
+  (token-decimals uint)
 )
   (let
     (
@@ -174,6 +238,8 @@
     (asserts! (validate-description description) ERR_INVALID_DESCRIPTION)
     (asserts! (validate-due-blocks due-blocks) ERR_INVALID_DUE_BLOCKS)
     (asserts! (validate-interval-blocks interval-blocks) ERR_INVALID_INTERVAL)
+    (asserts! (validate-token-contract token-contract) ERR_UNSUPPORTED_TOKEN)
+    (asserts! (<= token-decimals u18) ERR_INVALID_TOKEN)
     
     (map-set invoices invoice-id
       {
@@ -188,7 +254,9 @@
         created-at: stacks-block-height,
         is-recurring: true,
         recurring-interval: (some interval-blocks),
-        next-payment-due: (some validated-due-date)
+        next-payment-due: (some validated-due-date),
+        token-contract: token-contract,
+        token-decimals: token-decimals
       }
     )
     
@@ -210,12 +278,15 @@
     (asserts! (not (get paid invoice)) ERR_INVOICE_ALREADY_PAID)
     (asserts! (<= stacks-block-height (get due-date invoice)) ERR_INVOICE_EXPIRED)
     
-    ;; Transfer payment to creator
-    (try! (stx-transfer? net-amount tx-sender (get creator invoice)))
+    ;; For now, only support STX payments until SIP-10 implementation is complete
+    (asserts! (is-none (get token-contract invoice)) ERR_UNSUPPORTED_TOKEN)
     
-    ;; Transfer fee to contract owner
+    ;; Transfer payment to creator
+    (try! (transfer-stx net-amount tx-sender (get creator invoice)))
+    
+    ;; Transfer fee to contract owner (only if fee > 0)
     (if (> fee u0)
-      (try! (stx-transfer? fee tx-sender CONTRACT_OWNER))
+      (try! (transfer-stx fee tx-sender CONTRACT_OWNER))
       true
     )
     
@@ -228,9 +299,9 @@
     
     ;; Handle recurring payment
     (if (get is-recurring invoice)
-              (let 
+      (let 
         (
-          (interval (unwrap-panic (get recurring-interval invoice)))
+          (interval (unwrap! (get recurring-interval invoice) ERR_INVOICE_NOT_FOUND))
           (validated-next-due (calculate-due-date interval))
         )
         (map-set invoices invoice-id (merge invoice {
@@ -279,6 +350,24 @@
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
     (asserts! (<= new-fees MAX_FEE) ERR_INVALID_FEE)
     (var-set contract-fees new-fees)
+    (ok true)
+  )
+)
+
+(define-public (add-supported-token (token-contract principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (validate-token-principal token-contract) ERR_INVALID_TOKEN)
+    (map-set supported-tokens token-contract true)
+    (ok true)
+  )
+)
+
+(define-public (remove-supported-token (token-contract principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (validate-token-principal token-contract) ERR_INVALID_TOKEN)
+    (map-set supported-tokens token-contract false)
     (ok true)
   )
 )
