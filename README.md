@@ -9,6 +9,7 @@ StackPay enables freelancers and businesses to create, send, and track crypto in
 ## Features
 
 - 📄 **Invoice Creation**: Generate professional invoices with customizable amounts and descriptions
+- 📋 **Invoice Templates**: Create reusable templates for common service types and recurring billing
 - 🔄 **Recurring Payments**: Set up automated recurring invoices with flexible intervals
 - 🪙 **Multi-token Ready**: Foundation for STX and future SIP-10 token support
 - 💸 **Secure Payments**: Direct STX transfers with built-in escrow and fee handling
@@ -21,11 +22,19 @@ StackPay enables freelancers and businesses to create, send, and track crypto in
 
 ### Read-Only Functions
 - `get-invoice(invoice-id)` - Retrieve invoice details
+- `get-template(template-id)` - Retrieve template details
 - `get-user-invoices(user)` - Get all invoices created by a user
 - `get-recipient-invoices(recipient)` - Get all invoices for a recipient
+- `get-user-templates(user)` - Get all templates created by a user
 - `is-invoice-overdue(invoice-id)` - Check if invoice is past due date
 - `is-token-supported(token-contract)` - Check if a SIP-10 token is supported
 - `calculate-fee(amount)` - Calculate platform fee for an amount
+
+### Invoice Template Functions
+- `create-template(name, description, default-amount, default-due-blocks, is-recurring, default-interval, token-contract, token-decimals)` - Create reusable invoice template
+- `update-template(template-id, ...)` - Update existing template (creator only)
+- `deactivate-template(template-id)` - Deactivate template (creator only)
+- `create-invoice-from-template(template-id, recipient, amount, due-blocks)` - Create invoice using template
 
 ### Public Functions
 - `create-invoice(recipient, amount, description, due-blocks, token-contract, token-decimals)` - Create a one-time invoice
@@ -65,6 +74,58 @@ clarinet test
 ```
 
 ## Usage Examples
+
+### Invoice Templates
+
+```clarity
+;; Create a web development template
+(contract-call? .stackpay create-template 
+  u"Web Development" 
+  u"Professional web development services" 
+  u100000000  ;; $100 STX default
+  u1008       ;; 1 week due blocks
+  false       ;; Not recurring
+  none        ;; No interval
+  none        ;; STX payment
+  u6          ;; STX decimals
+)
+
+;; Create recurring consulting template
+(contract-call? .stackpay create-template 
+  u"Monthly Consulting" 
+  u"Monthly consulting retainer" 
+  u50000000   ;; $50 STX default
+  u1008       ;; 1 week due blocks
+  true        ;; Recurring
+  (some u4032) ;; Monthly interval
+  none        ;; STX payment
+  u6          ;; STX decimals
+)
+
+;; Create invoice from template
+(contract-call? .stackpay create-invoice-from-template 
+  u1 ;; template-id
+  'ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM ;; recipient
+  (some u150000000) ;; override amount to $150
+  none ;; use template default due blocks
+)
+
+;; Update template
+(contract-call? .stackpay update-template 
+  u1 ;; template-id
+  u"Updated Web Development" 
+  u"Updated professional web development services" 
+  u120000000  ;; New default $120 STX
+  u1008       ;; 1 week due blocks
+  false       ;; Not recurring
+  none        ;; No interval
+  none        ;; STX payment
+  u6          ;; STX decimals
+)
+
+;; Deactivate template when no longer needed
+(contract-call? .stackpay deactivate-template u1)
+```
 
 ### STX Invoices
 
@@ -126,6 +187,32 @@ The contract includes the framework for SIP-10 token support:
 (contract-call? .stackpay is-token-supported .some-token)
 ```
 
+## Invoice Templates
+
+Invoice templates streamline the billing process by allowing users to create reusable templates for common services. This feature is particularly useful for:
+
+### Common Use Cases
+- **Freelancers**: Create templates for different service types (web development, design, writing)
+- **Consultants**: Set up recurring monthly or weekly consultation templates
+- **SaaS Providers**: Monthly/yearly subscription templates
+- **Service Businesses**: Standard service packages with preset amounts and terms
+
+### Template Features
+- **Reusable Definitions**: Save time by reusing common invoice configurations
+- **Flexible Overrides**: Override template defaults when creating invoices
+- **Template Management**: Update, deactivate, and organize your templates
+- **Creator Control**: Only template creators can modify their templates
+- **Active Status**: Deactivated templates cannot be used for new invoices
+
+### Template Data Structure
+Each template stores:
+- Template name and description
+- Default amount and due date
+- Recurring configuration (if applicable)
+- Token type and decimals
+- Creator and creation timestamp
+- Active status
+
 ## Multi-token Framework
 
 StackPay includes a framework for future multi-token support:
@@ -154,11 +241,13 @@ The contract charges a 0.5% fee on all successful payments to maintain the platf
 
 - All payments are atomic - they either complete fully or revert
 - Invoice creators can only cancel their own unpaid invoices
+- Template creators can only modify their own templates
 - Recurring payments require explicit calls to prevent unexpected charges
 - Built-in validation prevents invalid amounts and self-payments
 - Token whitelist prevents unauthorized token usage
 - Proper error handling prevents "unchecked data" issues
 - All parameters are validated before processing
+- Template deactivation prevents misuse of outdated templates
 
 ## Error Codes
 
@@ -177,6 +266,9 @@ The contract charges a 0.5% fee on all successful payments to maintain the platf
 - `u112` - Invalid token
 - `u113` - Token transfer failed
 - `u114` - Unsupported token
+- `u115` - Template not found
+- `u116` - Invalid template name
+- `u117` - Template already exists
 
 ## Contributing
 
@@ -190,22 +282,24 @@ The contract charges a 0.5% fee on all successful payments to maintain the platf
 
 StackPay is designed with extensibility in mind. Here are planned future enhancements:
 
-### **Phase 2: Multi-token Ecosystem**
+### **Phase 2: Multi-token Ecosystem** ✅ *Invoice Templates Added*
+- **Invoice Templates** ✅ - Predefined templates for common service types
 - **Multi-token Support** - Accept payments in other SIP-10 tokens beyond STX
 - **Token Analytics** - Track payment patterns across different tokens
 - **Cross-token Conversion** - Automatic token swapping for payments
 
 ### **Phase 3: Enhanced User Experience**
-- **Invoice Templates** - Predefined templates for common service types
 - **Partial Payments** - Allow installment payments for large invoices
 - **Invoice Analytics** - Dashboard with payment trends and insights
 - **Mobile App Integration** - Native mobile app for invoice management
+- **Template Categories** - Organize templates by service type or industry
 
 ### **Phase 4: Enterprise Features**
 - **Multi-signature Approval** - Require multiple approvals for high-value invoices
 - **Payment Escrow** - Hold payments in escrow until service completion
 - **Tax Integration** - Automatic tax calculation and reporting features
 - **Invoice Notifications** - Email/SMS reminders for upcoming due dates
+- **Template Sharing** - Share templates between team members
 
 ### **Phase 5: Advanced Capabilities**
 - **Dispute Resolution** - Built-in arbitration system for payment disputes

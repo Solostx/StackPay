@@ -1,6 +1,6 @@
 ;; StackPay - Peer-to-peer multi-token invoicing and recurring payment system
 ;; Contract for invoice creation, payment enforcement, and recurring payments
-;; Supports STX and SIP-10 tokens
+;; Supports STX and SIP-10 tokens with invoice templates
 
 ;; Constants
 (define-constant CONTRACT_OWNER tx-sender)
@@ -19,6 +19,9 @@
 (define-constant ERR_INVALID_TOKEN (err u112))
 (define-constant ERR_TOKEN_TRANSFER_FAILED (err u113))
 (define-constant ERR_UNSUPPORTED_TOKEN (err u114))
+(define-constant ERR_TEMPLATE_NOT_FOUND (err u115))
+(define-constant ERR_INVALID_TEMPLATE_NAME (err u116))
+(define-constant ERR_TEMPLATE_ALREADY_EXISTS (err u117))
 
 ;; Limits
 (define-constant MAX_DUE_BLOCKS u52560) ;; ~1 year in blocks
@@ -30,6 +33,7 @@
 
 ;; Data Variables
 (define-data-var next-invoice-id uint u1)
+(define-data-var next-template-id uint u1)
 (define-data-var contract-fees uint u50) ;; 0.5% fee in basis points
 
 ;; Data Maps
@@ -49,12 +53,31 @@
     recurring-interval: (optional uint), ;; in blocks
     next-payment-due: (optional uint),
     token-contract: (optional principal), ;; none for STX, principal for SIP-10
-    token-decimals: uint ;; for display purposes
+    token-decimals: uint, ;; for display purposes
+    template-id: (optional uint) ;; reference to template used
+  }
+)
+
+(define-map invoice-templates
+  uint
+  {
+    creator: principal,
+    name: (string-utf8 64),
+    description: (string-utf8 256),
+    default-amount: uint,
+    default-due-blocks: uint,
+    is-recurring: bool,
+    default-interval: (optional uint),
+    token-contract: (optional principal),
+    token-decimals: uint,
+    created-at: uint,
+    active: bool
   }
 )
 
 (define-map user-invoices principal (list 100 uint))
 (define-map recipient-invoices principal (list 100 uint))
+(define-map user-templates principal (list 20 uint))
 (define-map supported-tokens principal bool) ;; Whitelist of supported SIP-10 tokens
 
 ;; Read-only functions
@@ -62,8 +85,16 @@
   (map-get? invoices invoice-id)
 )
 
+(define-read-only (get-template (template-id uint))
+  (map-get? invoice-templates template-id)
+)
+
 (define-read-only (get-current-invoice-id)
   (var-get next-invoice-id)
+)
+
+(define-read-only (get-current-template-id)
+  (var-get next-template-id)
 )
 
 (define-read-only (get-user-invoices (user principal))
@@ -72,6 +103,10 @@
 
 (define-read-only (get-recipient-invoices (recipient principal))
   (default-to (list) (map-get? recipient-invoices recipient))
+)
+
+(define-read-only (get-user-templates (user principal))
+  (default-to (list) (map-get? user-templates user))
 )
 
 (define-read-only (get-contract-fees)
@@ -106,8 +141,18 @@
   )
 )
 
+(define-private (add-to-user-templates (user principal) (template-id uint))
+  (let ((current-templates (get-user-templates user)))
+    (map-set user-templates user (unwrap-panic (as-max-len? (append current-templates template-id) u20)))
+  )
+)
+
 (define-private (validate-description (desc (string-utf8 256)))
   (> (len desc) u0)
+)
+
+(define-private (validate-template-name (name (string-utf8 64)))
+  (and (> (len name) u0) (<= (len name) u64))
 )
 
 (define-private (validate-due-blocks (blocks uint))
@@ -171,6 +216,241 @@
   )
 )
 
+;; Template functions
+(define-public (create-template
+  (name (string-utf8 64))
+  (description (string-utf8 256))
+  (default-amount uint)
+  (default-due-blocks uint)
+  (is-recurring bool)
+  (default-interval (optional uint))
+  (token-contract (optional principal))
+  (token-decimals uint)
+)
+  (let 
+    (
+      (template-id (var-get next-template-id))
+    )
+    (asserts! (validate-template-name name) ERR_INVALID_TEMPLATE_NAME)
+    (asserts! (validate-description description) ERR_INVALID_DESCRIPTION)
+    (asserts! (validate-amount default-amount) ERR_INVALID_AMOUNT)
+    (asserts! (validate-due-blocks default-due-blocks) ERR_INVALID_DUE_BLOCKS)
+    (asserts! (validate-token-contract token-contract) ERR_UNSUPPORTED_TOKEN)
+    (asserts! (<= token-decimals u18) ERR_INVALID_TOKEN)
+    (asserts! (if is-recurring
+                (match default-interval
+                  interval (validate-interval-blocks interval)
+                  false)
+                true) ERR_INVALID_INTERVAL)
+    
+    (map-set invoice-templates template-id
+      {
+        creator: tx-sender,
+        name: name,
+        description: description,
+        default-amount: default-amount,
+        default-due-blocks: default-due-blocks,
+        is-recurring: is-recurring,
+        default-interval: default-interval,
+        token-contract: token-contract,
+        token-decimals: token-decimals,
+        created-at: stacks-block-height,
+        active: true
+      }
+    )
+    
+    (add-to-user-templates tx-sender template-id)
+    (var-set next-template-id (+ template-id u1))
+    
+    (ok template-id)
+  )
+)
+
+(define-public (update-template
+  (template-id uint)
+  (name (string-utf8 64))
+  (description (string-utf8 256))
+  (default-amount uint)
+  (default-due-blocks uint)
+  (is-recurring bool)
+  (default-interval (optional uint))
+  (token-contract (optional principal))
+  (token-decimals uint)
+)
+  (let
+    (
+      (template (unwrap! (map-get? invoice-templates template-id) ERR_TEMPLATE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator template)) ERR_NOT_AUTHORIZED)
+    (asserts! (get active template) ERR_TEMPLATE_NOT_FOUND)
+    (asserts! (validate-template-name name) ERR_INVALID_TEMPLATE_NAME)
+    (asserts! (validate-description description) ERR_INVALID_DESCRIPTION)
+    (asserts! (validate-amount default-amount) ERR_INVALID_AMOUNT)
+    (asserts! (validate-due-blocks default-due-blocks) ERR_INVALID_DUE_BLOCKS)
+    (asserts! (validate-token-contract token-contract) ERR_UNSUPPORTED_TOKEN)
+    (asserts! (<= token-decimals u18) ERR_INVALID_TOKEN)
+    (asserts! (if is-recurring
+                (match default-interval
+                  interval (validate-interval-blocks interval)
+                  false)
+                true) ERR_INVALID_INTERVAL)
+    
+    (map-set invoice-templates template-id (merge template
+      {
+        name: name,
+        description: description,
+        default-amount: default-amount,
+        default-due-blocks: default-due-blocks,
+        is-recurring: is-recurring,
+        default-interval: default-interval,
+        token-contract: token-contract,
+        token-decimals: token-decimals
+      }
+    ))
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-template (template-id uint))
+  (let
+    (
+      (template (unwrap! (map-get? invoice-templates template-id) ERR_TEMPLATE_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator template)) ERR_NOT_AUTHORIZED)
+    (asserts! (get active template) ERR_TEMPLATE_NOT_FOUND)
+    
+    (map-set invoice-templates template-id (merge template { active: false }))
+    (ok true)
+  )
+)
+
+(define-public (create-invoice-from-template
+  (template-id uint)
+  (recipient principal)
+  (amount (optional uint))
+  (due-blocks (optional uint))
+)
+  (let
+    (
+      (template (unwrap! (map-get? invoice-templates template-id) ERR_TEMPLATE_NOT_FOUND))
+      (final-amount (default-to (get default-amount template) amount))
+      (final-due-blocks (default-to (get default-due-blocks template) due-blocks))
+    )
+    (asserts! (get active template) ERR_TEMPLATE_NOT_FOUND)
+    (asserts! (not (is-eq recipient tx-sender)) ERR_INVALID_RECIPIENT)
+    (asserts! (validate-amount final-amount) ERR_INVALID_AMOUNT)
+    (asserts! (validate-due-blocks final-due-blocks) ERR_INVALID_DUE_BLOCKS)
+    
+    (if (get is-recurring template)
+      (create-recurring-invoice-with-template
+        template-id
+        recipient
+        final-amount
+        (get description template)
+        final-due-blocks
+        (unwrap! (get default-interval template) ERR_INVALID_INTERVAL)
+        (get token-contract template)
+        (get token-decimals template)
+      )
+      (create-invoice-with-template
+        template-id
+        recipient
+        final-amount
+        (get description template)
+        final-due-blocks
+        (get token-contract template)
+        (get token-decimals template)
+      )
+    )
+  )
+)
+
+(define-private (create-invoice-with-template
+  (template-id uint)
+  (recipient principal)
+  (amount uint)
+  (description (string-utf8 256))
+  (due-blocks uint)
+  (token-contract (optional principal))
+  (token-decimals uint)
+)
+  (let 
+    (
+      (invoice-id (var-get next-invoice-id))
+      (validated-due-date (calculate-due-date due-blocks))
+    )
+    (map-set invoices invoice-id
+      {
+        creator: tx-sender,
+        recipient: recipient,
+        amount: amount,
+        description: description,
+        due-date: validated-due-date,
+        paid: false,
+        paid-amount: u0,
+        paid-at: none,
+        created-at: stacks-block-height,
+        is-recurring: false,
+        recurring-interval: none,
+        next-payment-due: none,
+        token-contract: token-contract,
+        token-decimals: token-decimals,
+        template-id: (some template-id)
+      }
+    )
+    
+    (add-to-user-invoices tx-sender invoice-id)
+    (add-to-recipient-invoices recipient invoice-id)
+    (var-set next-invoice-id (+ invoice-id u1))
+    
+    (ok invoice-id)
+  )
+)
+
+(define-private (create-recurring-invoice-with-template
+  (template-id uint)
+  (recipient principal)
+  (amount uint)
+  (description (string-utf8 256))
+  (due-blocks uint)
+  (interval-blocks uint)
+  (token-contract (optional principal))
+  (token-decimals uint)
+)
+  (let
+    (
+      (invoice-id (var-get next-invoice-id))
+      (validated-due-date (calculate-due-date due-blocks))
+    )
+    (map-set invoices invoice-id
+      {
+        creator: tx-sender,
+        recipient: recipient,
+        amount: amount,
+        description: description,
+        due-date: validated-due-date,
+        paid: false,
+        paid-amount: u0,
+        paid-at: none,
+        created-at: stacks-block-height,
+        is-recurring: true,
+        recurring-interval: (some interval-blocks),
+        next-payment-due: (some validated-due-date),
+        token-contract: token-contract,
+        token-decimals: token-decimals,
+        template-id: (some template-id)
+      }
+    )
+    
+    (add-to-user-invoices tx-sender invoice-id)
+    (add-to-recipient-invoices recipient invoice-id)
+    (var-set next-invoice-id (+ invoice-id u1))
+    
+    (ok invoice-id)
+  )
+)
+
 ;; Public functions
 (define-public (create-invoice 
   (recipient principal) 
@@ -207,7 +487,8 @@
         recurring-interval: none,
         next-payment-due: none,
         token-contract: token-contract,
-        token-decimals: token-decimals
+        token-decimals: token-decimals,
+        template-id: none
       }
     )
     
@@ -256,7 +537,8 @@
         recurring-interval: (some interval-blocks),
         next-payment-due: (some validated-due-date),
         token-contract: token-contract,
-        token-decimals: token-decimals
+        token-decimals: token-decimals,
+        template-id: none
       }
     )
     
